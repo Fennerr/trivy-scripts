@@ -3,6 +3,7 @@ import subprocess
 import sys
 import argparse
 import boto3
+import re
 
 def get_args():
     parser = argparse.ArgumentParser(description="AWS profile name.")
@@ -38,19 +39,12 @@ def parse_kubectl_output():
         output[first_part] = image_urls
     return output
 
-args = get_args()
+def is_ecr_image(image_url):
+    return re.match(r"\d+\.dkr\.ecr\..+\.amazonaws\.com", image_url)
 
-# Intialize AWS session and login using docker CLI to ECR
-s = boto3.Session(profile_name=args.profile,region_name=args.region)
-account_id = get_account_id(s)
-ECR_URI = f"{account_id}.dkr.ecr.{args.region}.amazonaws.com"
-stdout, stderr = perform_docker_login(args.profile, account_id, args.region)
-
-if not 'Login Succeeded' in stdout:
-    print("Docker login to {ECR_URI} failed")
-    print("Docker Login STDOUT:", stdout)
-    print("Docker Login STDERR:", stderr)
-    exit(-1)
+def get_ecr_region_from_url(image_url):
+    match = re.search(r"\d+\.dkr\.ecr\.(.+)\.amazonaws\.com", image_url)
+    return match.group(1) if match else None
 
 
 def create_subdirectory(path_str):
@@ -79,10 +73,10 @@ def create_subdirectory(path_str):
         os.makedirs(subdirectory)
 
 # Function that will execute trivy, and print the output from trivy in real-time
-def execute_and_stream_trivy_output(namespace_podname,trivy_url):
+def execute_and_stream_trivy_output(namespace_podname, trivy_url):
     create_subdirectory(namespace_podname)
     cmd  = f'trivy image {trivy_url}'
-    cmd += f' -f table -o output/{namespace_podname}/{trivy_url.replace("/","_")}.table'
+    cmd += f' -f json -o output/{namespace_podname}/{trivy_url.replace("/","_")}.json'
     print(f'Executing: {cmd}')
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
 
@@ -105,7 +99,25 @@ def execute_and_stream_trivy_output(namespace_podname,trivy_url):
                 print(error.strip(), file=sys.stderr)
             break
 
-pods_dict = parse_kubectl_output()
-for k,v in pods_dict.items():
-    for image_url in v:
-        execute_and_stream_trivy_output(k,image_url)
+if __name__ == '__main__':
+    args = get_args()
+
+    # Intialize AWS session and login using docker CLI to ECR
+    s = boto3.Session(profile_name=args.profile,region_name=args.region)
+    account_id = get_account_id(s)
+
+    pods_dict = parse_kubectl_output()
+    for k,v in pods_dict.items():
+        for image_url in v:
+            if is_ecr_image(image_url):
+                ecr_region = get_ecr_region_from_url(image_url)
+                if ecr_region and ecr_region != last_login_region:
+                    stdout, stderr = perform_docker_login(args.profile, account_id, ecr_region)
+                    if 'Login Succeeded' in stdout:
+                        last_login_region = ecr_region
+                    else:
+                        print(f"Docker login to {account_id}.dkr.ecr.{ecr_region}.amazonaws.com failed")
+                        print("Docker Login STDOUT:", stdout)
+                        print("Docker Login STDERR:", stderr)
+                        continue
+            execute_and_stream_trivy_output(k, image_url)

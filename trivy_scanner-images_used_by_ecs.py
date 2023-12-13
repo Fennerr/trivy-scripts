@@ -16,8 +16,7 @@ def get_account_id(boto_session):
     return sts.get_caller_identity()["Account"]
 
 def get_regions_for_service(boto_session, service_name):
-    ec2 = boto_session.client('ec2')
-    return [region['RegionName'] for region in ec2.describe_regions()['Regions'] if service_name in ec2.describe_availability_zones(Filters=[{'Name': 'region-name', 'Values': [region['RegionName']]}])['AvailabilityZones'][0]['ZoneName']]
+    return boto_session.get_available_regions(service_name=service_name)
 
 def perform_docker_login(profile_name, account_id, region):
     cmd = f"aws ecr get-login-password --profile {profile_name} --region {region} | docker login --username AWS --password-stdin {account_id}.dkr.ecr.{region}.amazonaws.com"
@@ -41,18 +40,9 @@ def get_ecr_region_from_url(image_url):
     match = re.search(r"\d+\.dkr\.ecr\.(.+)\.amazonaws\.com", image_url)
     return match.group(1) if match else None
 
-args = get_args()
-
-# Initialize AWS session
-s = boto3.Session(profile_name=args.profile, region_name=args.region)
-account_id = get_account_id(s)
-ecs_regions = get_regions_for_service(s, 'ecs')
-
-last_login_region = None
-
 def execute_and_stream_trivy_output(image_url):
     cmd  = f'trivy image {image_url}'
-    cmd += f' -f table -o {image_url.replace("/","_")}.table'
+    cmd += f' -f json -o {image_url.replace("/","_")}.json'
     print(f'Executing: {cmd}')
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
 
@@ -68,18 +58,27 @@ def execute_and_stream_trivy_output(image_url):
                 print(error.strip(), file=sys.stderr)
             break
 
-for region in ecs_regions:
-    images = get_ecs_task_definitions(s, region)
-    for image_url in images:
-        if is_ecr_image(image_url):
-            ecr_region = get_ecr_region_from_url(image_url)
-            if ecr_region and ecr_region != last_login_region:
-                stdout, stderr = perform_docker_login(args.profile, account_id, ecr_region)
-                if 'Login Succeeded' in stdout:
-                    last_login_region = ecr_region
-                else:
-                    print(f"Docker login to {account_id}.dkr.ecr.{ecr_region}.amazonaws.com failed")
-                    print("Docker Login STDOUT:", stdout)
-                    print("Docker Login STDERR:", stderr)
-                    continue
-        execute_and_stream_trivy_output(image_url)
+if __name__ == '__main__':
+    args = get_args()
+
+    # Initialize AWS session
+    s = boto3.Session(profile_name=args.profile, region_name=args.region)
+    account_id = get_account_id(s)
+    ecs_regions = get_regions_for_service(s, 'ecs')
+
+    last_login_region = None
+    for region in ecs_regions:
+        images = get_ecs_task_definitions(s, region)
+        for image_url in images:
+            if is_ecr_image(image_url):
+                ecr_region = get_ecr_region_from_url(image_url)
+                if ecr_region and ecr_region != last_login_region:
+                    stdout, stderr = perform_docker_login(args.profile, account_id, ecr_region)
+                    if 'Login Succeeded' in stdout:
+                        last_login_region = ecr_region
+                    else:
+                        print(f"Docker login to {account_id}.dkr.ecr.{ecr_region}.amazonaws.com failed")
+                        print("Docker Login STDOUT:", stdout)
+                        print("Docker Login STDERR:", stderr)
+                        continue
+            execute_and_stream_trivy_output(image_url)

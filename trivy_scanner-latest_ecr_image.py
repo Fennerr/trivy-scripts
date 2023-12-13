@@ -13,42 +13,19 @@ def get_account_id(boto_session):
     sts = boto_session.client("sts")
     return sts.get_caller_identity()["Account"]
 
+def get_regions_for_service(boto_session, service_name):
+    return boto_session.get_available_regions(service_name=service_name)
+
 def perform_docker_login(profile_name, account_id, region):
     cmd = f"aws ecr get-login-password --profile {profile_name} --region {region} | docker login --username AWS --password-stdin {account_id}.dkr.ecr.{region}.amazonaws.com"
     result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
     return result.stdout, result.stderr
 
-args = get_args()
-
-# Intialize AWS session and login using docker CLI to ECR
-s = boto3.Session(profile_name=args.profile,region_name=args.region)
-account_id = get_account_id(s)
-ECR_URI = f"{account_id}.dkr.ecr.{args.region}.amazonaws.com"
-stdout, stderr = perform_docker_login(args.profile, account_id, args.region)
-
-if not 'Login Succeeded' in stdout:
-    print("Docker login to {ECR_URI} failed")
-    print("Docker Login STDOUT:", stdout)
-    print("Docker Login STDERR:", stderr)
-    exit(-1)
-
-# Get ECR repos
-ecr = s.client('ecr')
-repositories = ecr.describe_repositories()["repositories"]
-print(f"Found {len(repositories)} repositories in ECR")
-# Get the latest image tag for each repo
-jmespath_expression = 'sort_by(imageDetails, &to_string(imagePushedAt))[-1].imageTags'
-for repo in repositories:
-    repo_name = repo["repositoryName"]
-    paginator = ecr.get_paginator('describe_images')
-    iterator = paginator.paginate(repositoryName=repo_name)
-    filter_iterator = iterator.search(jmespath_expression)
-    repo["latestImageTag"] = list(filter_iterator)[0]
 
 # Function that will execute trivy, and print the output from trivy in real-time
-def execute_and_stream_trivy_output(repo_name,latest_image_tag):
-    cmd  = f'trivy image {ECR_URI}/{repo_name}:{latest_image_tag}'
-    cmd += f' -f table -o {repo_name}:{latest_image_tag}_results.table'
+def execute_and_stream_trivy_output(repo_name,latest_image_tag,ecr_uri):
+    cmd  = f'trivy image {ecr_uri}/{repo_name}:{latest_image_tag}'
+    cmd += f' -f json -o {repo_name}:{latest_image_tag}_results.json'
     print(f'Executing: {cmd}')
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
 
@@ -71,8 +48,40 @@ def execute_and_stream_trivy_output(repo_name,latest_image_tag):
                 print(error.strip(), file=sys.stderr)
             break
 
-for repo in repositories:
-    execute_and_stream_trivy_output(repo["repositoryName"],repo["latestImageTag"])
+if __name__ == '__main__':
+    args = get_args()
+
+    # Intialize AWS session and login using docker CLI to ECR
+    s = boto3.Session(profile_name=args.profile,region_name=args.region)
+    account_id = get_account_id(s)
+    ecs_regions = get_regions_for_service(s, 'ecr')
+    
+    for region in ecs_regions:
+        ecr_uri = f"{account_id}.dkr.ecr.{region}.amazonaws.com"
+        stdout, stderr = perform_docker_login(args.profile, account_id, region)
+
+        if not 'Login Succeeded' in stdout:
+            print("Docker login to {ecr_uri} failed")
+            print("Docker Login STDOUT:", stdout)
+            print("Docker Login STDERR:", stderr)
+            continue
+        
+        # Get ECR repos
+        ecr = s.client('ecr', region_name=region)
+        repositories = ecr.describe_repositories()["repositories"]
+        print(f"Found {len(repositories)} repositories in ECR in {region}")
+
+        # Get the latest image tag for each repo
+        jmespath_expression = 'sort_by(imageDetails, &to_string(imagePushedAt))[-1].imageTags'
+        for repo in repositories:
+            repo_name = repo["repositoryName"]
+            paginator = ecr.get_paginator('describe_images')
+            iterator = paginator.paginate(repositoryName=repo_name)
+            filter_iterator = iterator.search(jmespath_expression)
+            repo["latestImageTag"] = list(filter_iterator)[0]
+
+        for repo in repositories:
+            execute_and_stream_trivy_output(repo["repositoryName"],repo["latestImageTag"],ecr_uri)
 
 
 
