@@ -1,6 +1,6 @@
 
 This repo contains scripts I have made to:
-* Scan the latest image in ECR
+* Scan the latest images in ECR
 * Scan images in use by Kubernetes
 * Scan images in use by ECS
 
